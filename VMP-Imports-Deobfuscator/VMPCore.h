@@ -64,6 +64,9 @@ namespace VMPCore
 
 	inline bool bUseIatSection = false;
 
+	inline std::vector<std::uint8_t> vecIatBuffer{};
+	inline std::uintptr_t pNewSectionRva{};
+
 	inline std::vector<IMAGE_SECTION_HEADER> vecProcessSections{};
 
 	void ParseModules();
@@ -75,6 +78,7 @@ namespace VMPCore
 
 	bool RebuildIAT();
 	bool PatchCalls();
+	bool DumpModule(const std::string& outputPath);
 }
 
 

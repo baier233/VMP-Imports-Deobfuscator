@@ -145,66 +145,45 @@ void VMPCore::ParseApiList()
 
 bool VMPCore::SetPatchIatAddress()
 {
-	std::vector<std::uint8_t> vecIatContent(k32IatSize + 4);
-	std::uintptr_t pBytesRead;
+	bool allFound = true;
 
-	// @note: @colby57: Read IAT content from the target process.
-	if (!ReadProcessMemory(ProcessAccessHelp::hProcess, reinterpret_cast<void*>(pIatAddress), vecIatContent.data(), k32IatSize, &pBytesRead))
-	{
-		spdlog::error("Cannot read IAT content! Error: {}", GetLastError());
-
-		vecIatContent.clear();
-		vecIatContent.shrink_to_fit();
-
-		return false;
-	}
-
-	bool Found = false;
-
-	// @note: @colby57: Iterate through the patch information vector.
 	for (auto& sIatPatchInfo : vecPatchInfo)
 	{
-		for (int i = 0; i < k32IatSize; i += sizeof(std::uintptr_t))
-		{
-			// @note: @colby57: Read data from the IAT content.
-			std::uintptr_t data = *reinterpret_cast<std::uintptr_t*>(vecIatContent.data() + i);
+		bool found = false;
 
-			// @note: @colby57: Check if the data matches the API address in the patch information.
+		for (std::size_t i = 0; i < k32IatSize; i += sizeof(std::uintptr_t))
+		{
+			std::uintptr_t data = *reinterpret_cast<std::uintptr_t*>(vecIatBuffer.data() + i);
+
 			if (data == sIatPatchInfo.m_pApiAddress)
 			{
-				// @note: @colby57: Set the IAT address in the patch information.
 				sIatPatchInfo.m_pIatAddress = pIatAddress + i;
-				Found = true;
+				found = true;
 				break;
 			}
 		}
 
-		if (!Found)
-			spdlog::error("Cannot find api address in new IAT? 0x{0:x}", sIatPatchInfo.m_pApiAddress);
+		if (!found)
+		{
+			spdlog::error("Cannot find api address in new IAT: 0x{0:x}", sIatPatchInfo.m_pApiAddress);
+			allFound = false;
+		}
 	}
 
-	vecIatContent.clear();
-	vecIatContent.shrink_to_fit();
-
-	return Found;
+	return allFound;
 }
 
 static void VMPCore::ApplyPatches()
 {
 	std::vector<std::uint8_t> vecCode(32);
-
 	int iCodeLen{};
-	std::uintptr_t WrittedBytes{};
 
-	// @note: @colby57: Iterate through the patch information vector and apply patches.
 	for (const auto& sIatPatchInfo : vecPatchInfo)
 	{
 		const auto iCallIatMode = sIatPatchInfo.m_iCallIatMode;
 
-		// @note: @colby57: Check if the call mode is known.
 		if (iCallIatMode != VMPCore::CALL_IAT_UNKNOWN)
 		{
-			// @note: @colby57: Assemble the call instruction.
 			if (iCodeLen = ZydisWrapper::AssembleCall(
 				vecCode.data(),
 				vecCode.size(),
@@ -213,16 +192,11 @@ static void VMPCore::ApplyPatches()
 				sIatPatchInfo.m_pPatchAddress,
 				sIatPatchInfo.m_iRegIndex))
 			{
-				// @note: @colby57: Check if the assembled code is valid.
-
-														// @note: @baier233: Processing specifically for the mov instruction.
 				if (iCodeLen == 5 || iCodeLen == 6 || ((iCallIatMode == CALL_IAT_MOV_REG || iCallIatMode == VMPCore::CALL_IAT_MOV_REFERENCE) && iCodeLen == 7))
 				{
-					// @note: @colby57: Write the assembled code to the patch address.
-					if (!WriteProcessMemory(ProcessAccessHelp::hProcess, reinterpret_cast<void*>(sIatPatchInfo.m_pPatchAddress), vecCode.data(), iCodeLen, &WrittedBytes))
-					{
-						spdlog::error("Cannot apply patch to: 0x{0:x}", sIatPatchInfo.m_pPatchAddress);
-					}
+					auto bufferOffset = sIatPatchInfo.m_pPatchAddress - pImageLoadAddress;
+					auto* pDest = reinterpret_cast<std::uint8_t*>(pImageBuffer) + bufferOffset;
+					memcpy(pDest, vecCode.data(), iCodeLen);
 				}
 			}
 			else
@@ -237,92 +211,51 @@ bool VMPCore::RebuildIAT()
 {
 	int Num{};
 	int Index{};
-	std::uintptr_t WrittedBytes{};
-	std::uintptr_t Buffer{};
 
-	// @note: @colby57: Calculate the total number of entries in the IAT.
 	for (auto ImportEchmoduleApi : mapImportEchmoduleApi)
 		Num += ImportEchmoduleApi.second.size();
 
 	Num += vecModuleList.size();
 
 	k32IatSize = Num * sizeof(std::uintptr_t);
-	std::size_t nSize = (k32IatSize / 0x1000 + 1) * 0x1000;
 
-	DWORD dwOldProtect;
+	vecIatBuffer.resize(k32IatSize, 0);
+	auto* pIatEntries = reinterpret_cast<std::uintptr_t*>(vecIatBuffer.data());
 
-	// @note: @colby57: Change protection of the allocated memory to PAGE_READWRITE.
-	if (VirtualProtectEx(ProcessAccessHelp::hProcess, (LPVOID)pIatAddress, nSize, PAGE_READWRITE, &dwOldProtect) == 0)
-	{
-		spdlog::error("Cannot change protect for new IAT");
-		return false;
-	}
-
-	// @note: @colby57: Write API addresses to the new IAT.
 	for (auto ImportEchmoduleApi : mapImportEchmoduleApi)
 	{
 		auto EachModuleApiSet = ImportEchmoduleApi.second;
 
 		for (auto pApiAddress : EachModuleApiSet)
 		{
-			if (!WriteProcessMemory(
-				ProcessAccessHelp::hProcess,
-				(void*)(pIatAddress + Index * sizeof(std::uintptr_t)),
-				&pApiAddress, sizeof(std::uintptr_t),
-				&WrittedBytes))
-			{
-				spdlog::critical("[1] WriteProcessMemory failed: {}", GetLastError());
-				return false;
-			}
-
+			pIatEntries[Index] = pApiAddress;
 			Index += 1;
 		}
 
-		// @note: @colby57: Write a placeholder buffer after each module's API addresses.
-		if (!WriteProcessMemory(
-			ProcessAccessHelp::hProcess,
-			(void*)((std::uintptr_t)pIatAddress + Index * sizeof(std::uintptr_t)),
-			&Buffer, sizeof(std::uintptr_t),
-			&WrittedBytes))
-		{
-			spdlog::critical("[2] WriteProcessMemory failed: {}", GetLastError());
-			return false;
-		}
-
+		pIatEntries[Index] = 0;
 		Index += 1;
 	}
 
-	spdlog::info("IAT Created. Address: {0:x}, Size: {1:x}", pIatAddress, k32IatSize);
+	spdlog::info("IAT built: {0:x} bytes, {1} entries", k32IatSize, Index);
 	return true;
 }
 
 bool VMPCore::PatchCalls()
 {
-	// @note: @colby57: Check if the IAT section is specified.
-	if (!bUseIatSection)
-	{
-		spdlog::error("Initialize error 1. Allocated memory won't work here. Use -i \"section_name\". Bruh!\n");
-		return false;
-	}
-
-	// @note: @colby57: Attempt to rebuild the IAT.
 	if (!RebuildIAT())
 	{
-		spdlog::error("Initialize error 2. Rebuild IAT failed!\n");
+		spdlog::error("RebuildIAT failed!");
 		return false;
 	}
 
-	// @note: @colby57: Set patch addresses for IAT.
 	if (!SetPatchIatAddress())
 	{
-		spdlog::error("Initialize error 3. Failed to set patches.\n");
+		spdlog::error("SetPatchIatAddress failed!");
 		return false;
 	}
 
-	spdlog::info("Fixing calls...\n");
-
-	// @note: @colby57: Apply the patches to E8 calls.
-	ApplyPatches();
+	// ApplyPatches is deferred to DumpModule where the final IAT RVA is known.
+	spdlog::info("Patch info collected: {} patches ready", vecPatchInfo.size());
 	return true;
 }
 
@@ -380,7 +313,7 @@ std::vector<std::string> GetVmpSections(ProcessMemory& sMemory)
 
 			// @note: @colby57: Check if entropy indicates a potentially VMP-protected section
 			// @note: @colby57: Files protected by VMProtect always show entropy above 7.
-			if (Entropy > 7.0)
+			if (Entropy > 7.1 && strcmp(".text", (char*)Section.Name) != 0)
 			{
 				spdlog::warn("Potentially VMP section: {}\n", (char*)Section.Name);
 				vecVmpSections.emplace_back((char*)Section.Name);
@@ -392,6 +325,7 @@ std::vector<std::string> GetVmpSections(ProcessMemory& sMemory)
 }
 
 void CollectMovIatReferences(std::uintptr_t pImageBase, std::size_t uImageSize, void* pPeBuffer, const std::vector<ptr_t>& vecAddressResults)
+
 {
 	if (pPeBuffer == nullptr)
 		return;
@@ -546,6 +480,240 @@ void CollectDirectIatCalls(std::uintptr_t pImageBase, std::size_t uImageSize, vo
 }
 
 
+bool VMPCore::DumpModule(const std::string& outputPath)
+{
+	auto* pBase = reinterpret_cast<std::uint8_t*>(pImageBuffer);
+	auto* pDosHeader = reinterpret_cast<IMAGE_DOS_HEADER*>(pBase);
+
+	if (pDosHeader->e_magic != IMAGE_DOS_SIGNATURE)
+	{
+		spdlog::error("Invalid DOS signature in buffer");
+		return false;
+	}
+
+	auto* pNtHeaders = reinterpret_cast<IMAGE_NT_HEADERS*>(pBase + pDosHeader->e_lfanew);
+
+	if (pNtHeaders->Signature != IMAGE_NT_SIGNATURE)
+	{
+		spdlog::error("Invalid NT signature in buffer");
+		return false;
+	}
+
+	// ── Step 1: Convert existing sections to file layout ────────────────
+	auto* pSectionHeader = IMAGE_FIRST_SECTION(pNtHeaders);
+	DWORD sectionAlignment = pNtHeaders->OptionalHeader.SectionAlignment;
+	DWORD fileAlignment = pNtHeaders->OptionalHeader.FileAlignment;
+
+	DWORD dwOrigFileSize = 0;
+	for (WORD i = 0; i < pNtHeaders->FileHeader.NumberOfSections; i++)
+	{
+		auto& sec = pSectionHeader[i];
+		sec.PointerToRawData = sec.VirtualAddress;
+		sec.SizeOfRawData = sec.Misc.VirtualSize;
+
+		DWORD secEnd = sec.PointerToRawData + sec.SizeOfRawData;
+		if (secEnd > dwOrigFileSize)
+			dwOrigFileSize = secEnd;
+	}
+	if (dwOrigFileSize > k32ImageSize)
+		dwOrigFileSize = static_cast<DWORD>(k32ImageSize);
+
+	// ── Step 2: Build new section content (.vimp) ───────────────────────
+	// Layout: [IAT entries] [align] [import descriptors] [dll names + INT arrays + hint/name entries]
+	std::vector<std::uint8_t> vecSectionData;
+
+	// IAT entries
+	auto iatOffsetInSection = vecSectionData.size();
+	vecSectionData.insert(vecSectionData.end(), vecIatBuffer.begin(), vecIatBuffer.end());
+
+	// Align to 8
+	while (vecSectionData.size() & 7)
+		vecSectionData.push_back(0);
+
+	// Compute new section RVA (aligned to SectionAlignment after last section)
+	auto& lastSec = pSectionHeader[pNtHeaders->FileHeader.NumberOfSections - 1];
+	DWORD lastSecEnd = lastSec.VirtualAddress + lastSec.Misc.VirtualSize;
+	DWORD newSectionRva = (lastSecEnd + sectionAlignment - 1) & ~(sectionAlignment - 1);
+
+	// Now we know the RVA, build import descriptors with correct addresses.
+	auto descriptorOffset = vecSectionData.size();
+	auto numModules = vecModuleList.size();
+	auto descriptorArraySize = (numModules + 1) * sizeof(IMAGE_IMPORT_DESCRIPTOR);
+
+	// Reserve space for descriptors (fill later)
+	auto descriptorStart = vecSectionData.size();
+	vecSectionData.resize(vecSectionData.size() + descriptorArraySize, 0);
+
+	int iatIndex = 0;
+	int descIndex = 0;
+
+	// Temporary storage for descriptor data (we'll write after building everything)
+	struct DescInfo {
+		DWORD nameRva;
+		DWORD oftRva;
+		DWORD ftRva;
+	};
+	std::vector<DescInfo> descInfos;
+
+	for (const auto& [moduleBase, apiSet] : mapImportEchmoduleApi)
+	{
+		DescInfo di{};
+
+		// DLL name string
+		ModuleInfo sTempModule{};
+		GetModulePathByAddress(moduleBase, sTempModule);
+		const WCHAR* wName = sTempModule.getFilename();
+		char dllName[MAX_PATH];
+		WideCharToMultiByte(CP_ACP, 0, wName, -1, dllName, MAX_PATH, nullptr, nullptr);
+		auto dllNameLen = strlen(dllName) + 1;
+
+		di.nameRva = newSectionRva + static_cast<DWORD>(vecSectionData.size());
+		vecSectionData.insert(vecSectionData.end(), dllName, dllName + dllNameLen);
+		if (vecSectionData.size() & 1) vecSectionData.push_back(0);
+
+		// OriginalFirstThunk (INT) array
+		di.oftRva = newSectionRva + static_cast<DWORD>(vecSectionData.size());
+		auto intEntryCount = apiSet.size() + 1;
+		auto intArraySize = intEntryCount * sizeof(IMAGE_THUNK_DATA64);
+		auto intArrayStart = vecSectionData.size();
+		vecSectionData.resize(vecSectionData.size() + intArraySize, 0);
+		auto* pIntArray = reinterpret_cast<IMAGE_THUNK_DATA64*>(vecSectionData.data() + intArrayStart);
+
+		// FirstThunk points to IAT entries at start of section
+		di.ftRva = newSectionRva + static_cast<DWORD>(iatOffsetInSection) + iatIndex * sizeof(std::uintptr_t);
+
+		// Hint/Name entries for each API
+		int apiIdx = 0;
+		for (auto pApiAddress : apiSet)
+		{
+			bool isSuspect = false;
+			auto* apiInfo = sApiReader.getApiByVirtualAddress(static_cast<DWORD_PTR>(pApiAddress), &isSuspect);
+
+			if (vecSectionData.size() & 1) vecSectionData.push_back(0);
+
+			if (apiInfo && apiInfo->name[0] != '\0')
+			{
+				auto hintNameRva = newSectionRva + static_cast<DWORD>(vecSectionData.size());
+				// WORD hint
+				vecSectionData.push_back(apiInfo->hint & 0xFF);
+				vecSectionData.push_back((apiInfo->hint >> 8) & 0xFF);
+				// name string
+				auto nameLen = strlen(apiInfo->name) + 1;
+				vecSectionData.insert(vecSectionData.end(), apiInfo->name, apiInfo->name + nameLen);
+
+				pIntArray[apiIdx].u1.AddressOfData = hintNameRva;
+			}
+			else
+			{
+				WORD ordinal = apiInfo ? apiInfo->ordinal : 0;
+				pIntArray[apiIdx].u1.Ordinal = IMAGE_ORDINAL_FLAG64 | ordinal;
+			}
+			apiIdx++;
+		}
+
+		iatIndex += static_cast<int>(apiSet.size()) + 1;
+		descInfos.push_back(di);
+		descIndex++;
+	}
+
+	// Fill in the descriptor array
+	auto* pDescriptors = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(vecSectionData.data() + descriptorStart);
+	for (size_t i = 0; i < descInfos.size(); i++)
+	{
+		pDescriptors[i].OriginalFirstThunk = descInfos[i].oftRva;
+		pDescriptors[i].Name = descInfos[i].nameRva;
+		pDescriptors[i].FirstThunk = descInfos[i].ftRva;
+		pDescriptors[i].TimeDateStamp = 0;
+		pDescriptors[i].ForwarderChain = 0;
+	}
+
+	// Align section size to FileAlignment
+	DWORD newSectionRawSize = static_cast<DWORD>(vecSectionData.size());
+	DWORD newSectionAlignedSize = (newSectionRawSize + fileAlignment - 1) & ~(fileAlignment - 1);
+	vecSectionData.resize(newSectionAlignedSize, 0);
+
+	// ── Step 3: Add new section header ──────────────────────────────────
+	// Align PointerToRawData to FileAlignment (PE spec requirement)
+	DWORD newSectionFileOffset = (dwOrigFileSize + fileAlignment - 1) & ~(fileAlignment - 1);
+
+	auto* pNewSec = &pSectionHeader[pNtHeaders->FileHeader.NumberOfSections];
+	memset(pNewSec, 0, sizeof(IMAGE_SECTION_HEADER));
+	memcpy(pNewSec->Name, ".vimp\0\0\0", 8);
+	pNewSec->Misc.VirtualSize = newSectionRawSize;
+	pNewSec->VirtualAddress = newSectionRva;
+	pNewSec->SizeOfRawData = newSectionAlignedSize;
+	pNewSec->PointerToRawData = newSectionFileOffset;
+	pNewSec->Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE;
+
+	pNtHeaders->FileHeader.NumberOfSections += 1;
+
+	// Update SizeOfImage
+	DWORD newImageSize = newSectionRva + ((newSectionRawSize + sectionAlignment - 1) & ~(sectionAlignment - 1));
+	pNtHeaders->OptionalHeader.SizeOfImage = newImageSize;
+
+	// ── Step 4: Update PE data directories ──────────────────────────────
+	auto& importDir = pNtHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+	importDir.VirtualAddress = newSectionRva + static_cast<DWORD>(descriptorOffset);
+	importDir.Size = static_cast<DWORD>(numModules * sizeof(IMAGE_IMPORT_DESCRIPTOR));
+
+	auto& iatDir = pNtHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT];
+	iatDir.VirtualAddress = newSectionRva + static_cast<DWORD>(iatOffsetInSection);
+	iatDir.Size = static_cast<DWORD>(k32IatSize);
+
+	// ── Step 5: Update pIatAddress for patches ──────────────────────────
+	// Recompute all patch IAT addresses: old pIatAddress was a placeholder,
+	// now replace with actual RVA-based address.
+	auto newIatBase = pImageLoadAddress + newSectionRva + iatOffsetInSection;
+	auto oldIatBase = pIatAddress;
+	for (auto& sIatPatchInfo : vecPatchInfo)
+	{
+		if (sIatPatchInfo.m_pIatAddress >= oldIatBase &&
+			sIatPatchInfo.m_pIatAddress < oldIatBase + k32IatSize)
+		{
+			sIatPatchInfo.m_pIatAddress = newIatBase + (sIatPatchInfo.m_pIatAddress - oldIatBase);
+		}
+	}
+	pIatAddress = newIatBase;
+
+	// Re-apply patches with corrected IAT addresses
+	ApplyPatches();
+
+	spdlog::info("New section .vimp at RVA {:X}, size {:X}", newSectionRva, newSectionAlignedSize);
+	spdlog::info("Import table: {} modules, IAT RVA: {:X}, Import RVA: {:X}",
+		numModules, newSectionRva + static_cast<DWORD>(iatOffsetInSection),
+		newSectionRva + static_cast<DWORD>(descriptorOffset));
+
+	// ── Step 6: Write file ──────────────────────────────────────────────
+	HANDLE hFile = CreateFileA(outputPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (hFile == INVALID_HANDLE_VALUE)
+	{
+		spdlog::error("Cannot create output file: {0}, error: {1}", outputPath, GetLastError());
+		return false;
+	}
+
+	DWORD dwWritten = 0;
+	// Write original module data
+	WriteFile(hFile, pBase, dwOrigFileSize, &dwWritten, nullptr);
+
+	// Pad to aligned file offset for new section
+	if (newSectionFileOffset > dwOrigFileSize)
+	{
+		std::vector<std::uint8_t> padding(newSectionFileOffset - dwOrigFileSize, 0);
+		DWORD dwPadWritten = 0;
+		WriteFile(hFile, padding.data(), static_cast<DWORD>(padding.size()), &dwPadWritten, nullptr);
+		dwWritten += dwPadWritten;
+	}
+
+	// Append new section
+	DWORD dwWritten2 = 0;
+	WriteFile(hFile, vecSectionData.data(), static_cast<DWORD>(vecSectionData.size()), &dwWritten2, nullptr);
+
+	CloseHandle(hFile);
+
+	spdlog::info("Module dumped to {0} ({1} bytes)", outputPath, dwWritten + dwWritten2);
+	return true;
+}
+
 int main(int argc, char** argv)
 {
 	argparse::ArgumentParser cProgram("VMP-Imports-Deobfuscator");
@@ -563,6 +731,10 @@ int main(int argc, char** argv)
 		.help("section that is used to storage new IAT, it maybe destroy vmp code")
 		.default_value<std::string>(".rdata");
 
+	cProgram.add_argument("-o", "--output")
+		.help("Output path for the dumped PE file")
+		.default_value<std::string>("dumped.dll");
+
 	try
 	{
 		cProgram.parse_args(argc, argv);
@@ -578,6 +750,7 @@ int main(int argc, char** argv)
 	auto iProcessId = cProgram.get<int>("--pid");
 	auto sNewIat = cProgram.get<std::string>("--iat");
 	auto sModuleName = cProgram.get<std::string>("--module");
+	auto sOutputPath = cProgram.get<std::string>("--output");
 
 	Process sProcess{};
 
@@ -621,45 +794,100 @@ int main(int argc, char** argv)
 		VMPCore::k32ImageSize = sTargetModule->size;
 		VMPCore::pImageBuffer = reinterpret_cast<std::uintptr_t>(pBuffer);
 
-		// @note: @colby57: Read the target module's data into the buffer.
-		if (NT_SUCCESS(sMemory.Read(sTargetModule->baseAddress, sTargetModule->size, pBuffer)))
+		// Read the target module page-by-page, forcing PAGE_EXECUTE_READWRITE
+		// on each region first to handle VMP self-remapped pages.
+		memset(pBuffer, 0, sTargetModule->size);
+		bool bReadSuccess = true;
+		{
+			const auto moduleBase = sTargetModule->baseAddress;
+			const auto moduleEnd = moduleBase + sTargetModule->size;
+			auto currentAddr = moduleBase;
+
+			while (currentAddr < moduleEnd)
+			{
+				MEMORY_BASIC_INFORMATION64 mbi{};
+				if (!NT_SUCCESS(sMemory.Query(currentAddr, &mbi)))
+				{
+					spdlog::warn("VirtualQuery failed at {:X}, skipping page", currentAddr);
+					currentAddr += 0x1000;
+					continue;
+				}
+
+				const auto regionBase = static_cast<uintptr_t>(mbi.BaseAddress);
+				const auto regionEnd = regionBase + mbi.RegionSize;
+				const auto readStart = max(currentAddr, regionBase);
+				const auto readEnd = min(moduleEnd, regionEnd);
+				const auto readSize = readEnd - readStart;
+				const auto bufferOffset = readStart - moduleBase;
+
+				if (mbi.State != MEM_COMMIT)
+				{
+					spdlog::debug("Skipping non-committed region at {:X} (state {:X})", readStart, mbi.State);
+					currentAddr = regionEnd;
+					continue;
+				}
+
+				DWORD dwOldProtect = 0;
+				bool bProtectChanged = false;
+
+				if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD) || mbi.Protect == 0)
+				{
+					if (NT_SUCCESS(sMemory.Protect(readStart, readSize, PAGE_EXECUTE_READWRITE, &dwOldProtect)))
+					{
+						bProtectChanged = true;
+						spdlog::debug("Changed protection at {:X} from {:X} to RWX", readStart, mbi.Protect);
+					}
+					else
+					{
+						spdlog::warn("Failed to change protection at {:X}, skipping", readStart);
+						currentAddr = regionEnd;
+						continue;
+					}
+				}
+
+				auto readStatus = sMemory.Read(readStart, readSize, static_cast<uint8_t*>(pBuffer) + bufferOffset);
+				if (!NT_SUCCESS(readStatus))
+				{
+					spdlog::warn("Read failed at {:X} size {:X} status {:X}", readStart, readSize, readStatus);
+				}
+
+				if (bProtectChanged)
+				{
+					sMemory.Protect(readStart, readSize, dwOldProtect);
+				}
+
+				currentAddr = regionEnd;
+			}
+
+			spdlog::info("Page-by-page read completed for module at {:X}", moduleBase);
+		}
+		if (bReadSuccess)
 		{
 			// @note: @colby57: Parse the PE image to extract information about its sections.
 			PEImage sPeImage;
 			sPeImage.Parse(pBuffer);
+
+
 
 			for (auto sSection : sPeImage.sections())
 				VMPCore::vecProcessSections.emplace_back(sSection);
 
 			const auto sExcludeSections = GetVmpSections(sMemory);
 
-			// @note: @colby57: Locate the section for the new IAT within the PE image.
-			for (auto& sSection : sPeImage.sections())
-			{
-				const auto result = strncmp(sNewIat.c_str(), (char*)sSection.Name, sNewIat.length());
-
-				if (result == 0)
-				{
-					spdlog::info("IAT Allocated in {}", sNewIat.c_str());
-					VMPCore::bUseIatSection = true;
-					VMPCore::pIatAddress = VMPCore::pImageLoadAddress + sSection.VirtualAddress;
-					break;
-				}
-			}
-
-			if (!VMPCore::bUseIatSection)
-			{
-				spdlog::critical("Section for new IAT is not found!");
-				free(pBuffer);
-				return 0;
-			}
+			// Use a placeholder IAT address (will be replaced in DumpModule with the actual new section RVA).
+			VMPCore::pIatAddress = VMPCore::pImageLoadAddress;
+			VMPCore::bUseIatSection = true;
 
 			// @note: @colby57: Iterate through sections, searching for specific patterns and filtering addresses.
 			for (auto sSection : sPeImage.sections())
 			{
+
+				spdlog::info("scanning section {}", (char*)sSection.Name);
 				if ((sSection.Characteristics & IMAGE_SCN_MEM_EXECUTE) &&
 					std::find(sExcludeSections.begin(), sExcludeSections.end(), (char*)sSection.Name) == sExcludeSections.end())
 				{
+
+					spdlog::info("scanning section enter {}", (char*)sSection.Name);
 					// @note: @colby57: Search for a specific pattern in the target section.
 					{
 						PatternSearch sPattern({ 0xE8,'?','?','?','?' });
@@ -821,6 +1049,17 @@ int main(int argc, char** argv)
 
 				return 0;
 			}
+
+			if (!VMPCore::DumpModule(sOutputPath))
+			{
+				spdlog::error("Failed to dump module!");
+				ProcessAccessHelp::closeProcessHandle();
+				free(pBuffer);
+				return 0;
+			}
+
+			ProcessAccessHelp::closeProcessHandle();
+			free(pBuffer);
 		}
 		else
 		{
